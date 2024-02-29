@@ -1,0 +1,4 @@
+/home/pbhatia4/Desktop/Adios2C-Implementation/build/CMakeFiles/sqlite3_library.dir
+/home/pbhatia4/Desktop/Adios2C-Implementation/build/CMakeFiles/executable.dir
+/home/pbhatia4/Desktop/Adios2C-Implementation/build/CMakeFiles/edit_cache.dir
+/home/pbhatia4/Desktop/Adios2C-Implementation/build/CMakeFiles/rebuild_cache.dir
