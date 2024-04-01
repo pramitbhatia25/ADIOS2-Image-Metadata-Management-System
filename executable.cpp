@@ -1,36 +1,330 @@
-/*
-# On execution, select from the options provided.
-# To insert data, enter 1.
-# To query data, enter 2.
-# To extract data, enter 3.
+//*****************************************************************************************************************************************************************/*
 
-# Data Insert:
-# Enter metadata and a link to raw image data.
-# 'Experiment Name' must be a unique field.
-# The raw image data will be converted into adios bp file, the location of which will be stored in the database along with the metadata.
+// Comments 
 
-# Data Query:
-# Query parameter is 'Experiment Name', thus enter the name of the experiment to query.
+// On execution, select from the options provided.
+// To insert data, enter 1.
+// To query data, enter 2.
+// To extract data, enter 3.
+// To delete data, enter 4.
 
-# Data Extract:
-# The adios bp data will be converted into raw images, and the metadata will be shown along with output location.
+// Data Insert:
+// Enter metadata and a link to the folder containing the raw image data.
+// 'Experiment Name' must be a unique field.
+// The raw image data will be converted into adios bp file, the location of which will be stored in the database along with the metadata.
 
-*/
+// Data Query:
+// Query parameter is 'Experiment Name', thus enter the name of the experiment to query.
+// Data Query returns the metadata for the experiment.
+
+// Data Extract:
+// The adios bp data will be converted into raw images, and the metadata will be shown along with output location.
+
+// Progress:
+// Metadata associated with image variable to be stored in the /bp file 
+// user manually input metaadata for each image, or a description inside a config file / json / yaml file in the database
+// store metadata in both database and adios bp file.
+// design a query interface to query over metadata and experiments.
+// ultimately integrate AI framework
+// 2 paths -- write raw data in adios bp file, another is to insert metadata into databases.
+
+// use protocol buffers to strucutre / serialize metadata.
+// use custom object detection model -- imagenet, huggingface - 
+// Metadata is manually inputted right now, now we should be able to use AI to label the images.
+// ETA before next sem
+
+//*****************************************************************************************************************************************************************
+
+//Imports
 
 #include <iostream>
-#include <sqlite3.h>
 #include <fstream>
 #include <vector>
 #include <experimental/filesystem>
+#include <fstream>
+
+// Define the path to the builds for the following in CMakeLists.txt
 #include <adios2.h>
+#include <sqlite3.h>
 #include <opencv2/opencv.hpp>
 
 namespace fs = std::experimental::filesystem;
+
+//*****************************************************************************************************************************************************************
+
+//Structs
+
+struct Detection
+{
+    int class_id;
+    float confidence;
+    cv::Rect box;
+};
+
 
 struct ConversionResult {
     std::string outputPath;
     std::string metadataContent;
 };
+
+//*****************************************************************************************************************************************************************
+
+// Function Definitions
+
+// Load NN Classes
+std::vector<std::string> load_class_list();
+
+// Load NN
+void load_net(cv::dnn::Net &net, bool is_cuda);
+
+// Perform Detection
+void detect(cv::Mat &image, cv::dnn::Net &net, std::vector<Detection> &output, const std::vector<std::string> &className);
+
+// Generate Metadata
+const std::string aiGen(const std::string& imagePath);
+
+// Convert Images to BP Format
+ConversionResult convert_images(const std::string& experimentName, const std::string& rawPath);
+
+// Inserts Data into SQLite Database
+void insertDataToDatabase(const std::string& authorName, const std::string& experimentName, const std::string& adiosOutputPath, const std::string& metadataContent);
+
+// Checks if experiment is in Database
+bool checkdb(const std::string& experimentName);
+
+// Retrieves Data from user, converts images and inserts into Sqlite
+void insertDataAndGetPath();
+
+// Queries all experiments in database
+bool queryAllData();
+
+// Extracts images from BP Format to output folder
+void extractImages();
+
+// Deletes experiment from database and bp file
+void deleteExperiment();
+
+// Main
+int main(int argc, char** argv);
+
+//*****************************************************************************************************************************************************************
+
+// Main
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cout << "Usage: Pass in a flag 1, 2, 3, 4 to make a choice.\n1.) Insert Data\n2.) Query Data\n3.) Extract Data\n4.) Delete Data\n";
+        return 1;
+    }
+
+    int choice = std::stoi(argv[1]);
+
+    std::cout << "\nSelected Choice: " << choice << "\n";
+    std::cout << "-----------------------------" << std::endl;
+
+    if (choice == 1) {
+        insertDataAndGetPath();
+    } else if (choice == 2) {
+        queryAllData();
+    } else if (choice == 3) {
+        extractImages();
+    } else if (choice == 4) {
+        deleteExperiment();
+    } else {
+        std::cerr << "Invalid choice. Please provide a valid flag (1, 2, 3 or 4)\n";
+        return 1;
+    }
+
+    std::cout << "\nThank you!\nTerminating\n";
+    return 0;
+}
+
+//*****************************************************************************************************************************************************************
+
+// Load NN Classes from classes.txt
+
+std::vector<std::string> load_class_list()
+{
+    std::vector<std::string> class_list;
+    std::ifstream ifs("/home/pbhatia4/Desktop/ObjectDetection-Test/classes.txt");
+    std::string line;
+    while (getline(ifs, line))
+    {
+        class_list.push_back(line);
+    }
+    return class_list;
+}
+
+//*****************************************************************************************************************************************************************
+
+// Load NN from predefined path
+
+void load_net(cv::dnn::Net &net, bool is_cuda)
+{
+    auto result = cv::dnn::readNet("/home/pbhatia4/Desktop/ObjectDetection-Test/yolov5s.onnx");
+    if (is_cuda)
+    {
+        std::cout << "Attempty to use CUDA\n";
+        result.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+        result.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA_FP16);
+    }
+    else
+    {
+        result.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        result.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    }
+    net = result;
+}
+
+//*****************************************************************************************************************************************************************
+
+// Define image format
+
+const std::vector<cv::Scalar> colors = {cv::Scalar(255, 255, 0), cv::Scalar(0, 255, 0), cv::Scalar(0, 255, 255), cv::Scalar(255, 0, 0)};
+
+const float INPUT_WIDTH = 640.0;
+const float INPUT_HEIGHT = 640.0;
+const float SCORE_THRESHOLD = 0.2;
+const float NMS_THRESHOLD = 0.4;
+const float CONFIDENCE_THRESHOLD = 0.4;
+
+cv::Mat format_yolov5(const cv::Mat &source) {
+    int col = source.cols;
+    int row = source.rows;
+    int _max = MAX(col, row);
+    cv::Mat result = cv::Mat::zeros(_max, _max, CV_8UC3);
+    source.copyTo(result(cv::Rect(0, 0, col, row)));
+    return result;
+}
+
+//*****************************************************************************************************************************************************************
+
+// Perform Detection
+
+void detect(cv::Mat &image, cv::dnn::Net &net, std::vector<Detection> &output, const std::vector<std::string> &className) {
+    cv::Mat blob;
+
+    auto input_image = format_yolov5(image);
+    
+    cv::dnn::blobFromImage(input_image, blob, 1./255., cv::Size(INPUT_WIDTH, INPUT_HEIGHT), cv::Scalar(), true, false);
+    
+    net.setInput(blob);
+
+    std::vector<cv::Mat> outputs;
+
+    net.forward(outputs, net.getUnconnectedOutLayersNames());
+
+    float x_factor = input_image.cols / INPUT_WIDTH;
+    float y_factor = input_image.rows / INPUT_HEIGHT;
+    
+    float *data = (float *)outputs[0].data;
+
+    const int dimensions = 85;
+    const int rows = 25200;
+    
+    std::vector<int> class_ids;
+    std::vector<float> confidences;
+    std::vector<cv::Rect> boxes;
+
+    for (int i = 0; i < rows; ++i) {
+
+        float confidence = data[4];
+        if (confidence >= CONFIDENCE_THRESHOLD) {
+
+            float * classes_scores = data + 5;
+            cv::Mat scores(1, className.size(), CV_32FC1, classes_scores);
+            cv::Point class_id;
+            double max_class_score;
+            minMaxLoc(scores, 0, &max_class_score, 0, &class_id);
+            if (max_class_score > SCORE_THRESHOLD) {
+
+                confidences.push_back(confidence);
+
+                class_ids.push_back(class_id.x);
+
+                float x = data[0];
+                float y = data[1];
+                float w = data[2];
+                float h = data[3];
+                int left = int((x - 0.5 * w) * x_factor);
+                int top = int((y - 0.5 * h) * y_factor);
+                int width = int(w * x_factor);
+                int height = int(h * y_factor);
+                boxes.push_back(cv::Rect(left, top, width, height));
+            }
+
+        }
+
+        data += 85;
+
+    }
+
+    std::vector<int> nms_result;
+    cv::dnn::NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD, nms_result);
+    for (int i = 0; i < nms_result.size(); i++) {
+        int idx = nms_result[i];
+        Detection result;
+        result.class_id = class_ids[idx];
+        result.confidence = confidences[idx];
+        result.box = boxes[idx];
+        output.push_back(result);
+    }
+}
+
+//*****************************************************************************************************************************************************************
+
+// Generate Metadata
+
+const std::string aiGen(const std::string& imagePath)
+{
+
+	std::vector<std::string> class_list = load_class_list();
+
+	cv::Mat frame;
+
+	bool is_cuda = 0;
+
+	cv::dnn::Net net;
+	load_net(net, is_cuda);
+
+
+	frame = cv::imread(imagePath);
+
+	if (frame.empty())
+	{
+		std::cerr << "Error loading image: " << imagePath << "\n";
+	}
+
+        std::vector<Detection> output;
+        detect(frame, net, output, class_list);
+
+        int detections = output.size();
+
+	std::string out = "";
+
+        for (int i = 0; i < detections; ++i)
+        {
+
+            auto detection = output[i];
+            auto box = detection.box;
+            auto classId = detection.class_id;
+            const auto color = colors[classId % colors.size()];
+            cv::rectangle(frame, box, color, 3);
+
+            cv::rectangle(frame, cv::Point(box.x, box.y - 20), cv::Point(box.x + box.width, box.y), color, cv::FILLED);
+            cv::putText(frame, class_list[classId].c_str(), cv::Point(box.x, box.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+
+	    out = class_list[classId].c_str();
+        }
+    std::cout << "Class: " << out << "\n";
+
+	
+    return out;
+}
+
+//*****************************************************************************************************************************************************************
+
+// Convert Images to BP Format
 
 ConversionResult convert_images(const std::string& experimentName, const std::string& rawPath) {
 	int rank, size;
@@ -103,7 +397,7 @@ ConversionResult convert_images(const std::string& experimentName, const std::st
 
 		do {
 			std::cout << "\nMetadata File Not Found!\nSelect an option below:\n";
-			std::cout << "1) Use empty metadata file\n2) AI generate metadata based on images\n3) Add custom metadata file content\n";
+			std::cout << "1) Use empty metadata file\n2) AI generate metadata based on images\n3) Add custom metadata file content\nSelect a choice (1/2/3): ";
 
 			int userChoice;
 			std::cin >> userChoice;
@@ -126,7 +420,14 @@ ConversionResult convert_images(const std::string& experimentName, const std::st
 				// Implement AI generation logic here if needed
 				// metadataContent = generateMetadataAI();
 				metadataContent = "";
+				
 				validChoice = true;
+
+				for (const auto& fileName : fileNames) {
+				std::string img_loc = "/home/pbhatia4/Desktop/Adios2C-Implementation/Data-Input/" + experimentName + "/" + fileName;	
+				std::string classification = aiGen(img_loc); // Assuming aiGen takes filename as input and returns classification as string
+				metadataContent += fileName + ": " + classification + "\n";
+				}
 				
 				if (metadataFile.is_open()) {
 					metadataFile << metadataContent;
@@ -185,6 +486,10 @@ ConversionResult convert_images(const std::string& experimentName, const std::st
 	bpFileWriter.Close();
 	return {outputPath, metadataContent};
 }
+
+//*****************************************************************************************************************************************************************
+
+// Insert Data To SQLite Database
 
 void insertDataToDatabase(const std::string& authorName, const std::string& experimentName, const std::string& adiosOutputPath, const std::string& metadataContent) {
 
@@ -273,6 +578,10 @@ void insertDataToDatabase(const std::string& authorName, const std::string& expe
 	sqlite3_close(db);
 }
 
+//*****************************************************************************************************************************************************************
+
+// Check DB
+
 bool checkdb(const std::string& experimentName) {
     sqlite3* db;
     int exit = 0;
@@ -325,6 +634,9 @@ bool checkdb(const std::string& experimentName) {
     return (rc == SQLITE_ROW);
 }
 
+//*****************************************************************************************************************************************************************
+
+// Retrieve Data from User, Convert Image and Insert Into Database
 
 void insertDataAndGetPath() {
 	std::string experimentName;
@@ -363,6 +675,10 @@ void insertDataAndGetPath() {
 		return;
 	}
 }
+
+//*****************************************************************************************************************************************************************
+
+// Query All Data
 
 bool queryAllData() {
     sqlite3* db;
@@ -412,6 +728,10 @@ bool queryAllData() {
 
     return true;
 }
+
+//*****************************************************************************************************************************************************************
+
+// Extract Images from Folder
 
 void extractImages() {
     sqlite3* db;
@@ -525,6 +845,10 @@ void extractImages() {
 
 }
 
+//*****************************************************************************************************************************************************************
+
+// Delete Experiment
+
 void deleteExperiment() {
 	sqlite3* db;
 	int exit = 0;
@@ -584,45 +908,4 @@ void deleteExperiment() {
 
 	std::cout << "Experiment '" << experimentName << "' Deleted Successfully!" << std::endl;		
 		
-}
-
-
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cout << "Usage: Pass in a flag 1, 2, 3, 4 to make a choice.\n1.) Insert Data\n2.) Query Data\n3.) Extract Data\n4.) Delete Data\n";
-        return 1;
-    }
-
-    int choice = std::stoi(argv[1]);
-
-    std::cout << "\nSelected Choice: " << choice << "\n";
-    std::cout << "-----------------------------" << std::endl;
-
-    if (choice == 1) {
-        insertDataAndGetPath();
-    } else if (choice == 2) {
-        queryAllData();
-    } else if (choice == 3) {
-        extractImages();
-    } else if (choice == 4) {
-        deleteExperiment();
-    } else {
-        std::cerr << "Invalid choice. Please provide a valid flag (1, 2, 3 or 4)\n";
-        return 1;
-    }
-
-    std::cout << "\nThank you!\nTerminating\n";
-    return 0;
-    
-    // Metadata associated with image variable to be stored in the /bp file 
-    // user manually input metaadata for each image, or a description inside a config file / json / yaml file in the database
-    // store metadata in both database and adios bp file.
-    // design a query interface to query over metadata and experiments.
-    // ultimately integrate AI framework
-    // 2 paths -- write raw data in adios bp file, another is to insert metadata into databases.
-    
-    // use protocol buffers to strucutre / serialize metadata.
-    // use custom object detection model -- imagenet, huggingface - 
-    // Metadata is manually inputted right now, now we should be able to use AI to label the images.
-    // ETA before next sem
 }
